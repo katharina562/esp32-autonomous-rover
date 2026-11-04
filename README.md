@@ -30,3 +30,15 @@ This provides the foundation for further mapping and autonomous navigation capab
 **Demo:** 
 
 https://github.com/user-attachments/assets/345ec12e-ef98-480d-b979-ba7b330e9cce
+
+### 4. Mapping
+
+Using the distance sensor that is connected to two 180° servo motors (left to right; up and down), the rover can scan its environment and visualize it on a map in 2d and 3d. In combination with the odometry, multiple scans from different positions can map a whole area.
+
+### 5. Autonomous exploration 
+
+Using the distance sensor for obstacle avoidance, the rover autonomously explores its surroundings by moving short distances and performing 180° scans at five different angles. When an obstacle is detected, it performs more detailed scans to map its surroundings. If an obstacle gets too close, the rover reverses, turns, and continues exploring in a different direction.
+
+### 6. Autonomous mapping 
+
+The rover autonomously explores a user-defined area, using obstacle avoidance to navigate safely around obstacles. While moving, it performs 2D scans (in the future 3d) and combines them into a map of its surroundings. Based on this map, it continuously selects new scan positions to gradually explore and map the entire area.

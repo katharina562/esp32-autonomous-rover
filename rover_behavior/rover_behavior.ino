@@ -233,6 +233,11 @@ void updateWheelFault(uint32_t absL, uint32_t absR) {
 // During autonomous straight legs, encoder distance is integrated at fixed heading.
 // This deliberately suppresses both gyro and differential-encoder yaw updates.
 extern bool exploreStraightHeadingLock;
+void handleExploreMove();
+void handleExploreOrient();
+void handleExploreState();
+void exploreDriveStop(const String &why);
+void driveWheels(int left,int right);
 void updateOdometry() {
   // Sample the gyro before consuming encoder increments; important when
   // odometry is called by HTTP handlers and not just the main loop.
@@ -285,6 +290,7 @@ void setWheelDirections(int left, int right) {
 extern float gyroTotalDegrees;
 extern float gyroSegmentDegrees;
 extern float gyroRateDps;
+extern uint16_t gyroSaturationCount;
 extern bool gyroTurning;
 extern uint32_t gyroQuietSinceMs;
 extern bool mpuAvailable;
@@ -302,6 +308,7 @@ void handleOdometry() {
   json += ",\"headingMode\":\"" + String((useGyroHeading && mpuAvailable) ? "gyro" : "encoder") + "\"";
   json += ",\"gyroSegment\":" + String(gyroSegmentDegrees, 1);
   json += ",\"gyroRate\":" + String(gyroRateDps, 2);
+  json += ",\"gyroSat\":" + String(gyroSaturationCount);
   json += ",\"gyroTurning\":" + String(gyroTurning ? "true" : "false");
   json += ",\"gyroAvailable\":" + String(mpuAvailable ? "true" : "false");
   json += ",\"wheelFault\":\"" + wheelFault + "\"";
@@ -756,6 +763,14 @@ STOPPED
       <p id="exploreStatus">Test mode: supervised driving only.</p>
       <p style="font-size:12px">Orange = inflated obstacle cells (12 cm center clearance; preview only). Blue = selected area. The rover does not drive automatically yet.</p>
     </div>
+    <div style="border:1px solid #1565c0;border-radius:10px;padding:14px;margin:12px 0;">
+      <h3>Manual Multi-Scan Mapping (temporary)</h3>
+      <p>Drive using WASD / arrow keys. Stop at each location, then add a scan to the same map.</p>
+      <button id="manualMapStart" class="scanButton">START NEW MANUAL MAP</button>
+      <button id="manualMapScan" class="scanButton" disabled>ADD 2D SCAN</button>
+      <button id="manualMapEnd" class="scanButton" disabled>END MANUAL MAPPING</button>
+      <p id="manualMapStatus">Inactive</p>
+    </div>
     <p>Registered scans: <b id="mapScanCount">0</b></p>
     <button id="resetGlobalMap" class="scanButton">RESET MAP + POSITION</button>
     <div style="display:flex;justify-content:center;align-items:center;gap:10px;flex-wrap:wrap;margin:12px 0">
@@ -1206,14 +1221,19 @@ const ROVER_ROW = GRID_ROWS / 2;
 let occupancyGrid = [];
 let observationGrid = [];
 let currentPose = {x:0, y:0, theta:0};
+let lastScanPose = {x:1e6, y:1e6, theta:0};
 let scanCount = 0;
 let roverTrail = [{x:0,y:0,theta:0}];
 let mapBusy = false;
+let manualMappingMode = false;
+let manualMapFullBounds = false;
 let exploreBounds = null;
 let explorePlanPath = [];
 let explorePlanTarget = null;
-const EXPLORE_RADIUS_MM = 110; // minimum center clearance for 20 cm wide rover; NOT zero safety margin
+const EXPLORE_RADIUS_MM = 140; // minimum center clearance for 20 cm wide rover; NOT zero safety margin
 function getExploreBounds() {
+  // Manual mapping can use the entire 8 x 8 m grid, independent of the exploration rectangle.
+  if (manualMapFullBounds) return {front:4000,back:4000,left:4000,right:4000};
   const ids=['exploreFront','exploreBack','exploreLeft','exploreRight'];
   const values=ids.map(id=>Number(document.getElementById(id).value));
   if(values.some(v=>!Number.isFinite(v)||v<0||v>300)) throw Error('Distances must be between 0 and 300 cm');
@@ -1232,7 +1252,7 @@ function renderExploreOverlay(ctx,cellWidth,cellHeight) {
   const rCells=Math.ceil(EXPLORE_RADIUS_MM/CELL_SIZE_MM);
   ctx.fillStyle='rgba(235,135,35,0.24)';
   for(let row=0;row<GRID_ROWS;row++)for(let col=0;col<GRID_COLS;col++){
-    if(occupancyGrid[row][col]<0.7)continue;
+    if(occupancyGrid[row][col]<0.5)continue;
     for(let dy=-rCells;dy<=rCells;dy++)for(let dx=-rCells;dx<=rCells;dx++){
       if(Math.hypot(dx,dy)*CELL_SIZE_MM>EXPLORE_RADIUS_MM)continue;
       const x=col+dx,y=row+dy;
@@ -1244,13 +1264,63 @@ function renderExploreOverlay(ctx,cellWidth,cellHeight) {
 }
 
 
-// Phase 2: conservative frontier-path PREVIEW ONLY. Never issues motor commands.
-// The sensor scans at one height; inspect the physical test track before driving.
+// Frontier-based exploration planner (v2). Never issues motor commands itself.
+// - Target = reachable known-free cell next to unexplored area inside the boundary,
+//   rated by path cost minus information gain (unknown cells around it).
+// - Path = Dijkstra over (cell, heading) with 8 neighbours and a TURN PENALTY, then
+//   simplified to few straight segments (line of sight). Fewer turns = fewer errors.
+// - Every visited target (and every failed one) goes on a blacklist, so unobservable
+//   pockets behind obstacles are not approached over and over.
+const EXPLORE_TURN_COST_MM_PER_DEG = 2.0;  // a 90 deg turn costs as much as 18 cm of driving
+const EXPLORE_GAIN_MM_PER_CELL = 4.0;      // reward per unknown cell around the target
+const EXPLORE_MIN_UNKNOWN = 15;            // ignore tiny holes between sensor rays
+const EXPLORE_MAX_SEGMENT_MM = 900;        // firmware accepts 5..1200 mm per move
+const EXPLORE_MAX_CYCLES = 60;
+const EXPLORE_BLOCK_OCC = 0.5;             // one contradicting free ray must not erase a hit (0.95-0.35=0.6)
+function exploreLog(msg){
+  console.log('EXPLORE: '+msg);
+  let el=document.getElementById('exploreLog');
+  if(!el){
+    el=document.createElement('pre');el.id='exploreLog';
+    el.style.cssText='text-align:left;font-size:11px;max-height:160px;overflow:auto;background:#fff;'+
+      'border:1px solid #ccc;padding:4px;margin:6px auto;max-width:680px;white-space:pre-wrap';
+    const st=document.getElementById('exploreStatus');st.parentNode.insertBefore(el,st.nextSibling);
+  }
+  el.textContent+=new Date().toLocaleTimeString()+'  '+msg+'\n';
+  el.scrollTop=el.scrollHeight;
+}
+let exploreBlacklist = [];
+function exploreSameDirection(a,b,c){
+  const ux=b.x-a.x,uy=b.y-a.y,vx=c.x-b.x,vy=c.y-b.y;
+  return Math.abs(Math.atan2(ux*vy-uy*vx,ux*vx+uy*vy))<0.05;
+}
+class ExploreHeap{
+  constructor(){this.k=[];this.v=[];}
+  get size(){return this.k.length;}
+  push(key,val){
+    const k=this.k,v=this.v;let i=k.length;k.push(key);v.push(val);
+    while(i>0){const p=(i-1)>>1;if(k[p]<=key)break;k[i]=k[p];v[i]=v[p];i=p;}
+    k[i]=key;v[i]=val;
+  }
+  pop(){
+    const k=this.k,v=this.v;const topK=k[0],topV=v[0];
+    const lastK=k.pop(),lastV=v.pop();const n=k.length;
+    if(n>0){
+      let i=0;
+      while(true){
+        let c=2*i+1;if(c>=n)break;
+        if(c+1<n&&k[c+1]<k[c])c++;
+        if(k[c]>=lastK)break;
+        k[i]=k[c];v[i]=v[c];i=c;
+      }
+      k[i]=lastK;v[i]=lastV;
+    }
+    return {key:topK,val:topV};
+  }
+}
 function computeExplorePlan() {
   const b=getExploreBounds(); exploreBounds=b;
   const W=GRID_COLS,H=GRID_ROWS,N=W*H;
-  // Minimal lateral clearance: 10 cm half-width plus 1 cm margin.
-  // IMPORTANT: in-place turns may need ~15 cm radius; test with open space.
   const BODY_RADIUS_MM=110;
   const inBounds=(c,r)=>{
     const right=(c-ROVER_COL)*CELL_SIZE_MM;
@@ -1264,69 +1334,127 @@ function computeExplorePlan() {
     const x=(c-ROVER_COL)*CELL_SIZE_MM,y=(ROVER_ROW-r)*CELL_SIZE_MM;
     return x>=-b.left&&x<=b.right&&y>=-b.back&&y<=b.front;
   };
-  const blocked=new Uint8Array(N),passable=new Uint8Array(N);
-  const clearance=BODY_RADIUS_MM; // keep occupied-cell body clearance
+  // Inflate known obstacles by the rover footprint + margin.
+  const blocked=new Uint8Array(N);
+  const clearance=EXPLORE_RADIUS_MM;   // centre-to-obstacle clearance (see constant above)
   const radius=Math.ceil(clearance/CELL_SIZE_MM);
   for(let r=0;r<H;r++)for(let c=0;c<W;c++){
-    if(!observationGrid[r][c]||occupancyGrid[r][c]<0.7)continue;
+    if(!observationGrid[r][c]||occupancyGrid[r][c]<EXPLORE_BLOCK_OCC)continue;
     for(let dr=-radius;dr<=radius;dr++)for(let dc=-radius;dc<=radius;dc++){
       if(Math.hypot(dc,dr)*CELL_SIZE_MM>clearance)continue;
       const rr=r+dr,cc=c+dc;
       if(rr>=0&&rr<H&&cc>=0&&cc<W)blocked[rr*W+cc]=1;
     }
   }
-  for(let r=0;r<H;r++)for(let c=0;c<W;c++){
-    const i=r*W+c;
-    // Unknown cells are tentative planning space, not confirmed free.
-    // Known occupied cells and their footprint clearance remain blocked.
-    if(inBounds(c,r)&&!blocked[i])passable[i]=1;
-  }
   const start=worldToCell(-currentPose.y,currentPose.x);
   if(start.col<0||start.col>=W||start.row<0||start.row>=H)throw Error('Rover outside map');
   const si=start.row*W+start.col;
-  // The initial rover may straddle the rear exploration boundary (back=0).
-  // Do not reject its starting position; subsequent destinations remain bounded.
-  // Starting footprint may overlap uncertain scan cells; still require clear
-  // destinations and stop immediately if the forward ToF sees an obstacle.
-  passable[si]=1;
-  const prev=new Int32Array(N).fill(-1),dist=new Int32Array(N).fill(-1);
-  const queue=new Int32Array(N);
-  let head=0,tail=0;queue[tail++]=si;dist[si]=0;
-  const dirs=[[1,0],[-1,0],[0,1],[0,-1]];
-  while(head<tail){
-    const i=queue[head++],c=i%W,r=(i/W)|0;
-    for(const [dc,dr] of dirs){
-      const cc=c+dc,rr=r+dr;
+  const knownFree=(c,r)=>observationGrid[r][c]&&occupancyGrid[r][c]<0.3;
+  // Only KNOWN free cells (plus the rover's own footprint) are driveable.
+  const ok=new Uint8Array(N);
+  const nearStart=Math.ceil(160/CELL_SIZE_MM);
+  for(let r=0;r<H;r++)for(let c=0;c<W;c++){
+    const i=r*W+c;
+    if(blocked[i]||!inBounds(c,r))continue;
+    if(knownFree(c,r)||Math.hypot(c-start.col,r-start.row)<=nearStart)ok[i]=1;
+  }
+  ok[si]=1;
+  // 8 directions, index k = k*45 deg counter-clockwise from "forward".
+  const DIRS=[];
+  for(let k=0;k<8;k++){
+    const phi=k*Math.PI/4;
+    DIRS.push({dc:Math.round(-Math.sin(phi))||0,dr:Math.round(-Math.cos(phi))||0,
+               len:(k%2?Math.SQRT2:1)*CELL_SIZE_MM});
+  }
+  const angDiff=(a,b)=>{const d=Math.abs(a-b)%8;return Math.min(d,8-d)*45;};
+  const k0=((Math.round(currentPose.theta/45)%8)+8)%8;
+  const dist=new Float32Array(N*8).fill(Infinity);
+  const prev=new Int32Array(N*8).fill(-1);
+  const heap=new ExploreHeap();
+  dist[si*8+k0]=0;heap.push(0,si*8+k0);
+  while(heap.size){
+    const {key,val:s}=heap.pop();
+    if(key>dist[s])continue;
+    const i=s>>3,d=s&7,c=i%W,r=(i/W)|0;
+    for(let nd=0;nd<8;nd++){
+      const D=DIRS[nd];
+      const cc=c+D.dc,rr=r+D.dr;
       if(cc<0||cc>=W||rr<0||rr>=H)continue;
       const j=rr*W+cc;
-      if(dist[j]<0&&passable[j]){dist[j]=dist[i]+1;prev[j]=i;queue[tail++]=j;}
+      if(!ok[j])continue;
+      if(D.dc!==0&&D.dr!==0&&(!ok[r*W+cc]||!ok[rr*W+c]))continue; // no corner cutting
+      const cost=key+D.len+EXPLORE_TURN_COST_MM_PER_DEG*angDiff(d,nd);
+      const ns=j*8+nd;
+      if(cost<dist[ns]){dist[ns]=cost;prev[ns]=s;heap.push(cost,ns);}
     }
   }
-  // Simple exploration: choose the nearest reachable point at least 10 cm away.
-  // No information-gain threshold and no requirement for new visible cells.
-  // Prefer forward progress when distances are equal; known obstacles stay blocked.
-  let best=-1, bestScore=Infinity, bestHeading=0;
+  const countUnknown=(c,r,R)=>{
+    let n=0;
+    for(let dr=-R;dr<=R;dr++)for(let dc=-R;dc<=R;dc++){
+      const cc=c+dc,rr=r+dr;
+      if(cc<0||cc>=W||rr<0||rr>=H||observationGrid[rr][cc])continue;
+      if(insideArea(cc,rr))n++;
+    }
+    return n;
+  };
+  let bestState=-1,bestScore=Infinity,reachable=0;
   for(let i=0;i<N;i++){
-    if(dist[i]<0 || dist[i]*CELL_SIZE_MM<100)continue;
+    if(!ok[i])continue;
+    let bd=Infinity,bs=-1;
+    for(let d=0;d<8;d++){const v=dist[i*8+d];if(v<bd){bd=v;bs=i*8+d;}}
+    if(bs<0)continue;
+    reachable++;
+    if(bd<100)continue;                         // at least 10 cm away
     const c=i%W,r=(i/W)|0;
-    const x=(c-ROVER_COL)*CELL_SIZE_MM;
-    const y=(ROVER_ROW-r)*CELL_SIZE_MM;
-    const score=dist[i]*CELL_SIZE_MM - 0.001*y + 0.0001*Math.abs(x);
-    if(score<bestScore){bestScore=score;best=i;}
+    if(!knownFree(c,r))continue;
+    const x=(c-ROVER_COL)*CELL_SIZE_MM,y=(ROVER_ROW-r)*CELL_SIZE_MM;
+    if(exploreBlacklist.some(p=>Math.hypot(p.x-x,p.y-y)<200))continue;
+    if(countUnknown(c,r,2)<1)continue;          // must touch unexplored space
+    const g=countUnknown(c,r,5);
+    if(g<EXPLORE_MIN_UNKNOWN)continue;          // gaps between rays are not frontiers
+    const score=bd-EXPLORE_GAIN_MM_PER_CELL*g;
+    if(score<bestScore){bestScore=score;bestState=bs;}
   }
-  if(best<0)throw Error('No reachable position at least 10 cm away within boundaries');
-  // Keep the scan facing forward. Motion orientation is handled by the existing
-  // turn-once-then-drive-straight controller.
-  bestHeading=0;
-  const path=[];
-  for(let i=best;i!==-1;i=prev[i]){
-    const c=i%W,r=(i/W)|0;
-    path.push({x:(c-ROVER_COL)*CELL_SIZE_MM,y:(ROVER_ROW-r)*CELL_SIZE_MM});
+  if(bestState<0)return null;                   // nothing left to explore
+  const cells=[];
+  for(let s=bestState;s!==-1;s=prev[s])cells.push(s>>3);
+  cells.reverse();
+  // Line-of-sight simplification: keep only the corners of the route.
+  const lineClear=(a,bb)=>{
+    let c=a%W,r=(a/W)|0;const c2=bb%W,r2=(bb/W)|0;
+    const dc=Math.abs(c2-c),dr=Math.abs(r2-r),sc=c<c2?1:-1,sr=r<r2?1:-1;
+    let err=dc-dr;
+    while(true){
+      if(!ok[r*W+c])return false;
+      if(c===c2&&r===r2)return true;
+      const e2=2*err;let stepC=false,stepR=false;
+      if(e2>-dr){err-=dr;c+=sc;stepC=true;}
+      if(e2<dc){err+=dc;r+=sr;stepR=true;}
+      if(stepC&&stepR&&(!ok[(r-sr)*W+c]||!ok[r*W+(c-sc)]))return false;
+    }
+  };
+  const pts=[cells[0]];
+  let ci=0;
+  while(ci<cells.length-1){
+    let j=cells.length-1;
+    while(j>ci+1&&!lineClear(cells[ci],cells[j]))j--;
+    pts.push(cells[j]);ci=j;
   }
-  path.reverse();
+  const toMm=i=>({x:((i%W)-ROVER_COL)*CELL_SIZE_MM,y:(ROVER_ROW-((i/W)|0))*CELL_SIZE_MM});
+  const wp=pts.map(toMm);
+  // Split long segments (firmware limit per move); collinear pieces are driven without extra turns.
+  const path=[wp[0]];
+  let lengthMm=0;
+  for(let k=1;k<wp.length;k++){
+    const a=wp[k-1],c2=wp[k];
+    const len=Math.hypot(c2.x-a.x,c2.y-a.y);
+    lengthMm+=len;
+    const n=Math.max(1,Math.ceil(len/EXPLORE_MAX_SEGMENT_MM));
+    for(let m=1;m<=n;m++)path.push({x:a.x+(c2.x-a.x)*m/n,y:a.y+(c2.y-a.y)*m/n});
+  }
   explorePlanPath=path;
-  explorePlanTarget={...path[path.length-1],theta:bestHeading};
-  return {cells:tail,steps:path.length-1,target:explorePlanTarget};
+  explorePlanTarget={...path[path.length-1],theta:0};
+  return {cells:reachable,steps:path.length-1,target:explorePlanTarget,lengthMm};
 }
 function renderExplorePlan(ctx,cellWidth,cellHeight){
   if(!explorePlanPath.length)return;
@@ -1616,6 +1744,7 @@ function drawScan(result) {
   scanCount++;
   explorePlanPath=[];explorePlanTarget=null;
   currentPose=pose;
+  lastScanPose={x:pose.x,y:pose.y,theta:pose.theta};
   roverTrail.push({...pose});
   document.getElementById("mapScanCount").textContent=scanCount;
   drawOccupancyGrid();
@@ -1638,12 +1767,71 @@ async function updateMapPose() {
 }
 setInterval(updateMapPose,1200);
 
+// Temporary manual mapping workflow. Reuse the existing /mapscan endpoint and drawScan().
+const manualMapStart = document.getElementById('manualMapStart');
+const manualMapScan = document.getElementById('manualMapScan');
+const manualMapEnd = document.getElementById('manualMapEnd');
+const manualMapStatus = document.getElementById('manualMapStatus');
+manualMapStart.addEventListener('click', async () => {
+  if (mapBusy || autonomous || exploreRunning) {
+    manualMapStatus.textContent = 'Stop other scanning/exploration first.'; return;
+  }
+  manualMapStart.disabled = true;
+  try {
+    await fetch('/stop');
+    const response = await fetch('/odometry/reset');
+    if (!response.ok) throw Error(await response.text());
+    manualMappingMode = true;
+    manualMapFullBounds = true;
+    exploreBounds = null;
+    currentPose = {x:0,y:0,theta:0};
+    roverTrail = [{...currentPose}];
+    lastScanPose = {x:1e6,y:1e6,theta:0};
+    scanCount = 0;
+    createEmptyGrid();
+    document.getElementById('mapScanCount').textContent = '0';
+    manualMapScan.disabled = false;
+    manualMapEnd.disabled = false;
+    manualMapStatus.textContent = 'Ready. Stop rover and click ADD 2D SCAN.';
+    drawOccupancyGrid();
+  } catch (e) {
+    manualMapStatus.textContent = 'Start failed: ' + e.message;
+    manualMapStart.disabled = false;
+  }
+});
+manualMapScan.addEventListener('click', async () => {
+  if (!manualMappingMode || mapBusy || autonomous || exploreRunning) return;
+  mapBusy = true;
+  manualMapScan.disabled = true;
+  manualMapStatus.textContent = 'Scanning at current position...';
+  try {
+    await fetch('/stop');
+    const response = await fetch('/mapscan');
+    if (!response.ok) throw Error(await response.text());
+    drawScan(await response.json());
+    manualMapStatus.textContent = scanCount + ' scans registered. Drive to next position.';
+  } catch (e) { manualMapStatus.textContent = 'Scan failed: ' + e.message; }
+  finally { mapBusy = false; manualMapScan.disabled = !manualMappingMode; }
+});
+manualMapEnd.addEventListener('click', async () => {
+  if (mapBusy) return;
+  await fetch('/stop');
+  manualMappingMode = false;
+  manualMapScan.disabled = true;
+  manualMapEnd.disabled = true;
+  manualMapStart.disabled = false;
+  manualMapStatus.textContent = 'Finished. Existing scans remain visible until reset/new map.';
+  drawOccupancyGrid();
+});
+
 document.getElementById("resetGlobalMap").addEventListener("click",async()=>{
   if(mapBusy || autonomous)return;
   try {
     const r=await fetch("/odometry/reset");
     if(!r.ok)throw Error("Reset failed");
     currentPose={x:0,y:0,theta:0};roverTrail=[{...currentPose}];
+    manualMappingMode=false;manualMapFullBounds=false;
+    manualMapScan.disabled=true;manualMapEnd.disabled=true;manualMapStart.disabled=false;
     scanCount=0;createEmptyGrid();drawOccupancyGrid();
     document.getElementById("mapScanCount").textContent="0";
     scanStatus.textContent="Map and odometry reset";
@@ -1663,8 +1851,8 @@ document.getElementById('explorePlan').addEventListener('click',()=>{
   try{
     explorePlanPath=[];explorePlanTarget=null;
     const plan=computeExplorePlan();drawOccupancyGrid();
-    status.textContent='GREEN dashed line = proposed route, dot = next scan position. '+
-      plan.steps+' grid steps ('+(plan.steps*CELL_SIZE_MM/10).toFixed(0)+' cm). PREVIEW ONLY — no driving.';
+    if(!plan){status.textContent='No reachable frontier left: exploration would be finished.';return;}
+    status.textContent='GREEN dashed line = proposed route ('+(plan.lengthMm/10).toFixed(0)+' cm), dot = next scan position. PREVIEW ONLY — no driving.';
   }catch(e){explorePlanPath=[];explorePlanTarget=null;drawOccupancyGrid();status.textContent='No safe path: '+e.message;}
 });
 document.getElementById('exploreFirstScan').addEventListener('click',async()=>{
@@ -1693,18 +1881,26 @@ async function exploreStopDrive(){
   try{await fetch('/explore/stop');}catch(e){}
 }
 document.getElementById('exploreStop').addEventListener('click',exploreStopDrive);
-async function exploreMoveCell(p,straightOnly=false){
+async function exploreMoveCell(p,straightOnly=false,finalLeg=false){
   // Map coordinates: x=right, y=forward. Odometry: x=forward, y=left.
   const wx=p.y,wy=-p.x;
-  const response=await fetch('/explore/move?x='+encodeURIComponent(wx)+'&y='+encodeURIComponent(wy)+(straightOnly?'&straight=1':''));
+  const response=await fetch('/explore/move?x='+encodeURIComponent(wx)+'&y='+encodeURIComponent(wy)+
+    (straightOnly?'&straight=1':'')+(finalLeg?'&final=1':''));
   if(!response.ok)throw Error('Move rejected: '+await response.text());
   const started=Date.now();
   while(exploreRunning){
     await exploreWait(120);
     const state=await (await fetch('/explore/state')).json();
     if(!state.active){
+      if(state.range>0){
+        // The forward sensor stopped the rover: enter that hit into the map so the
+        // planner knows the obstacle and does not drive into it again.
+        addSensorRay(90,state.range,{x:state.ox,y:state.oy,theta:state.oth});
+        drawOccupancyGrid();
+        exploreLog('  sensor stop: obstacle '+state.range+' mm ahead');
+      }
       if(state.status==='avoided'){exploreObstacleRecovery=true;return;}
-      if(state.status!=='arrived')throw Error('Drive stopped: '+state.status);
+      if(state.status!=='arrived')throw Error('Drive stopped: '+state.status+' ('+state.rem+' mm to waypoint)');
       return;
     }
     if(Date.now()-started>35000)throw Error('Waypoint watchdog timeout');
@@ -1716,10 +1912,13 @@ document.getElementById('exploreRun').addEventListener('click',async()=>{
   if(exploreRunning||mapBusy||autonomous)return;
   exploreRunning=true;
   document.getElementById('exploreRun').disabled=true;
+  let consecutiveFailures=0, finished=false;
+  const failCount=new Map();
   try{
     exploreBounds=getExploreBounds();
-    // Fresh map is preferable; initial scan only when map has no measurements.
-    for(let cycle=0;cycle<20&&exploreRunning;cycle++){
+    exploreBlacklist=[];
+    exploreLog('--- exploration started ---');
+    for(let cycle=0;cycle<EXPLORE_MAX_CYCLES&&exploreRunning;cycle++){
       if(scanCount===0){
         mapBusy=true;
         const r=await fetch('/mapscan');if(!r.ok)throw Error('Initial scan failed');
@@ -1727,51 +1926,53 @@ document.getElementById('exploreRun').addEventListener('click',async()=>{
       }
       await updateMapPose();
       const plan=computeExplorePlan();drawOccupancyGrid();
-      status.textContent='Cycle '+(cycle+1)+': driving '+plan.steps+' grid cells';
-      // Group consecutive grid steps with identical direction. Turn only at
-      // actual corners; never re-aim during one straight corridor.
+      if(!plan){finished=true;break;}          // no reachable frontier left = map is complete
       const path=explorePlanPath.slice();
-      let k=1;
-      while(k<path.length && exploreRunning){
-        const dx=path[k].x-path[k-1].x,dy=path[k].y-path[k-1].y;
-        let end=k;
-        while(end+1<path.length &&
-              Math.abs((path[end+1].x-path[end].x)-dx)<0.01 &&
-              Math.abs((path[end+1].y-path[end].y)-dy)<0.01)end++;
-        // One continuous drive command per straight section: no stop between 5-cm cells.
-        await exploreMoveCell(path[end],false);
-        if(exploreObstacleRecovery){
-          status.textContent='Obstacle avoided: reversing and turning, scanning again';
-          break;
+      const target={x:plan.target.x,y:plan.target.y};
+      const key=Math.round(target.x)+','+Math.round(target.y);
+      exploreLog('cycle '+(cycle+1)+': target ('+Math.round(target.x)+','+Math.round(target.y)+') mm, '+
+                 (plan.lengthMm/10).toFixed(0)+' cm, '+(path.length-1)+' legs');
+      status.textContent='Cycle '+(cycle+1)+': driving '+(plan.lengthMm/10).toFixed(0)+' cm to the next frontier';
+      let outcome='arrived',reason='';
+      try{
+        for(let k=1;k<path.length&&exploreRunning;k++){
+          // Collinear continuation of the same line: the firmware skips the turn.
+          const straight=k>1&&exploreSameDirection(path[k-2],path[k-1],path[k]);
+          await exploreMoveCell(path[k],straight,k===path.length-1);
+          if(exploreObstacleRecovery){outcome='obstacle';reason='obstacle avoided (reversed and turned)';break;}
         }
-        k=end+1;
+      }catch(e){
+        if(!String(e.message).startsWith('Drive stopped'))throw e;
+        outcome='failed';reason=e.message;
       }
       if(!exploreRunning)break;
-      // After obstacle avoidance, scan immediately from the new pose.
-      if(exploreObstacleRecovery){exploreObstacleRecovery=false;}
-      else {
-      const targetHeading=explorePlanTarget.theta;
-      const orient=await fetch('/explore/orient?theta='+encodeURIComponent(targetHeading));
-      if(!orient.ok)throw Error('Scan orientation rejected: '+await orient.text());
-      const orientStarted=Date.now();
-      while(exploreRunning){
-        await exploreWait(120);
-        const st=await (await fetch('/explore/state')).json();
-        if(!st.active){
-          if(st.status!=='arrived')throw Error('Scan orientation failed: '+st.status);
-          break;
+      exploreObstacleRecovery=false;
+      await updateMapPose();                    // where did the rover really end up?
+      const dTarget=Math.hypot(target.x-(-currentPose.y),target.y-currentPose.x);
+      if(outcome!=='arrived'){
+        const n=(failCount.get(key)||0)+1;failCount.set(key,n);
+        exploreLog('  '+outcome+': '+reason+' | '+Math.round(dTarget)+' mm from target | try '+n);
+        if(dTarget<250){outcome='arrived';exploreLog('  close enough: counts as arrived');}
+        else{
+          consecutiveFailures++;
+          if(n>=2){exploreBlacklist.push(target);exploreLog('  target given up');}
+          if(consecutiveFailures>=6)throw Error('6 failed drives in a row, last: '+reason);
         }
-        if(Date.now()-orientStarted>4500)throw Error('Scan orientation timeout');
       }
-      if(!exploreRunning)break;
-      }
-      mapBusy=true;
-      status.textContent='Cycle '+(cycle+1)+': scanning at destination';
-      const r=await fetch('/mapscan');if(!r.ok)throw Error('Scan failed: '+r.status);
-      drawScan(await r.json());mapBusy=false;
+      if(outcome==='arrived'){consecutiveFailures=0;exploreBlacklist.push(target);}
+      // Scan only if the pose really changed; the same view again adds nothing.
+      const moved=Math.hypot(currentPose.x-lastScanPose.x,currentPose.y-lastScanPose.y);
+      const turned=Math.abs(((currentPose.theta-lastScanPose.theta+540)%360)-180);
+      if(moved>80||turned>25){
+        mapBusy=true;
+        status.textContent='Cycle '+(cycle+1)+': scanning';
+        const r=await fetch('/mapscan');if(!r.ok)throw Error('Scan failed: '+r.status);
+        drawScan(await r.json());mapBusy=false;
+      }else exploreLog('  pose unchanged since the last scan: planning again without scanning');
     }
-    if(exploreRunning)status.textContent='Stopped after maximum 20 scan cycles.';
-  }catch(e){status.textContent='Exploration halted: '+e.message;}
+    if(finished){status.textContent='Exploration finished: no reachable frontier left.';exploreLog('--- finished ---');}
+    else if(exploreRunning)status.textContent='Stopped after maximum '+EXPLORE_MAX_CYCLES+' scan cycles.';
+  }catch(e){status.textContent='Exploration halted: '+e.message;exploreLog('HALTED: '+e.message);}
   finally{await exploreStopDrive();mapBusy=false;document.getElementById('exploreRun').disabled=false;}
 });
 
@@ -3451,7 +3652,7 @@ void setupMPU() {
     Serial.println("MPU-6050 not found; gyro test disabled");
     return;
   }
-  if (!mpuWrite(0x6B, 0x00) || !mpuWrite(0x1B, 0x00)) {
+  if (!mpuWrite(0x6B, 0x00) || !mpuWrite(0x1B, 0x08) || !mpuWrite(0x1A, 0x03)) {
     Serial.println("MPU-6050 initialization failed");
     return;
   }
@@ -3476,21 +3677,23 @@ void setupMPU() {
   Serial.println("MPU-6050 ready. Compare gyro and encoder angles.");
 }
 
+const float GYRO_LSB_PER_DPS = 65.5f;        // MPU-6050 range +-500 deg/s (reg 0x1B = 0x08)
+const uint32_t GYRO_COAST_WINDOW_MS = 350;   // keep integrating while the rover coasts after motor stop
+uint16_t gyroSaturationCount = 0;            // >0 while turning = range too small, angle would be too small
+
 void updateGyro() {
   if (!mpuAvailable) return;
-  const uint32_t now = micros();
-  const float dt = (uint32_t)(now - gyroLastMicros) * 1.0e-6f;
-  gyroLastMicros = now;
+  const uint32_t nowUs = micros();
+  const float dt = (uint32_t)(nowUs - gyroLastMicros) * 1.0e-6f;
+  gyroLastMicros = nowUs;
   int16_t raw;
   if (!mpuReadGyroZ(raw)) return;
-
-  float rawDps = float(raw) / 131.0f;
-  gyroRateDps = rawDps - gyroZOffset / 131.0f;
+  if (raw > 32000 || raw < -32000) gyroSaturationCount++;
+  const float prevRate = gyroRateDps;
+  gyroRateDps = (float(raw) - gyroZOffset) / GYRO_LSB_PER_DPS;
   bool motorsCommanded = (leftWheelDirection != 0 || rightWheelDirection != 0);
   bool rotatingNow = fabsf(gyroRateDps) >= (gyroTurning ? GYRO_STOP_DPS : GYRO_START_DPS);
-
-  // A genuine turn can also happen while driving straight (unequal wheel traction).
-  // Use measured angular rate, not only encoder difference or turn commands.
+  // gyroTurning is now only a status flag for the web UI; it no longer gates the integration.
   if (rotatingNow) {
     if (!gyroTurning) gyroSegmentDegrees = 0.0f;
     gyroTurning = true;
@@ -3501,32 +3704,33 @@ void updateGyro() {
       gyroTurning = false;
     }
   }
-
   static uint32_t lastMotorActiveMs = 0;
   if (motorsCommanded) lastMotorActiveMs = millis();
-  const bool motionWindow = motorsCommanded || (uint32_t)(millis() - lastMotorActiveMs) < 180;
+  const bool motionWindow = motorsCommanded ||
+                            (uint32_t)(millis() - lastMotorActiveMs) < GYRO_COAST_WINDOW_MS;
   if (!motionWindow) {
     gyroTurning = false;
     gyroQuietSinceMs = 0;
   }
-
-  if (motionWindow && gyroTurning && dt > 0.0f && dt < 0.1f) {
-    float delta = gyroRateDps * dt;
+  // While the motors run (or the rover coasts) ALWAYS integrate - no deadband, so slow
+  // turns and the last degrees of braking are not lost. At standstill nothing is
+  // integrated, therefore the displayed angle cannot drift while the rover is parked.
+  // Trapezoid rule + generous dt limit (WiFi / I2C can delay a loop pass).
+  if (motionWindow && dt > 0.0f && dt < 0.3f) {
+    float delta = 0.5f * (prevRate + gyroRateDps) * dt;
     gyroSegmentDegrees += delta;
     gyroTotalDegrees += delta;
   }
-
-  // Update the bias only after genuine stationary periods. Do not learn away
-  // slow turns while motors are running or immediately after a turn.
-  if (!motionWindow && !gyroTurning && fabsf(gyroRateDps) < GYRO_START_DPS) {
-    gyroZOffset = 0.995f * gyroZOffset + 0.005f * float(raw);
+  // Re-learn the bias at every standstill (temperature drift!). Faster than before.
+  if (!motionWindow && fabsf(gyroRateDps) < GYRO_START_DPS) {
+    gyroZOffset = 0.98f * gyroZOffset + 0.02f * float(raw);
   }
-
   if (millis() - gyroLastPrintMs >= 250) {
     gyroLastPrintMs = millis();
     Serial.print("Gyro total [deg]: "); Serial.print(gyroTotalDegrees, 1);
     Serial.print(" | segment [deg]: "); Serial.print(gyroSegmentDegrees, 1);
     Serial.print(" | rate [deg/s]: "); Serial.print(gyroRateDps, 2);
+    Serial.print(" | sat: "); Serial.print(gyroSaturationCount);
     Serial.print(" | Encoder [deg]: ");
     Serial.println(odomTotalTheta * 180.0f / PI, 1);
   }
@@ -3614,6 +3818,7 @@ void setup() {
       SCL_PIN
 
   );
+  Wire.setClock(400000);
 
   sensor.setTimeout(
 
@@ -3728,11 +3933,7 @@ void setup() {
 
       []() {
 
-        if (
-
-            !autonomousMode
-
-        ) {
+        if (!autonomousMode && !mappingScanActive && !scan3DActive && !exploreDriveActive) {
 
           forward();
 
@@ -3758,11 +3959,7 @@ void setup() {
 
       []() {
 
-        if (
-
-            !autonomousMode
-
-        ) {
+        if (!autonomousMode && !mappingScanActive && !scan3DActive && !exploreDriveActive) {
 
           backward();
 
@@ -3788,11 +3985,7 @@ void setup() {
 
       []() {
 
-        if (
-
-            !autonomousMode
-
-        ) {
+        if (!autonomousMode && !mappingScanActive && !scan3DActive && !exploreDriveActive) {
 
           turnLeft();
 
@@ -3818,11 +4011,7 @@ void setup() {
 
       []() {
 
-        if (
-
-            !autonomousMode
-
-        ) {
+        if (!autonomousMode && !mappingScanActive && !scan3DActive && !exploreDriveActive) {
 
           turnRight();
 
@@ -4015,122 +4204,293 @@ void setup() {
 
 }
 
-// EXPLORE-AREA waypoint controller: gyro for turns, fixed heading for straight legs.
-// Existing manual motion and gyro implementation are unchanged.
-bool exploreStraightHeadingLock=false;
+// =====================================================
+// EXPLORE-AREA waypoint controller (v2)
+//  - Motors stay DIGITAL (full power). "Speed" is made by time-sliced pulsing.
+//  - Turns are closed-loop to an ABSOLUTE heading (gyro) and are re-checked
+//    until the rover has really stopped inside the tolerance (no more blind
+//    overshoot that is carried into the straight leg).
+//  - Straight legs hold the heading with the gyro (one wheel is pulsed off
+//    when the rover drifts) and the gyro is integrated into odometry also
+//    while driving, so the map sees the real path.
+// =====================================================
+bool exploreStraightHeadingLock=false;   // legacy flag, kept for updateOdometry(); always false now
 bool exploreDriveActive=false;
-uint8_t exploreDrivePhase=0; // 0 idle, 1 align, 2 advance, 4 reverse, 5 turn away
+uint8_t exploreDrivePhase=0; // 0 idle, 1 align to goal, 2 advance, 3 orient only, 4 reverse, 5 turn away, 7 settle
+uint8_t exploreSettleNext=1; // after settling: 1 = move to goal, 3 = orient
+bool exploreStraightHint=false;
 float exploreGoalX=0, exploreGoalY=0;
 uint32_t explorePhaseStarted=0, exploreLastCheck=0;
 uint32_t exploreLastProgressMs=0;
-float exploreLastProgressHeading=0;
-float exploreLegStartX=0, exploreLegStartY=0, exploreLegHeading=0;
+float exploreLegStartX=0, exploreLegStartY=0, exploreLegHeading=0; // heading: absolute, rad
 float exploreLegDistance=0;
-float exploreTurnStartGyro=0;
-float exploreTurnLastGyro=0;
-float exploreTurnRequested=0;
-float exploreTurnHeadingStart=0;
-int exploreTurnDirection=0;
+float exploreTargetHeading=0;            // absolute target for turn phases, rad
+float exploreTurnLastErrDeg=0;
+float exploreTurnBoost=0;                // extra duty if the rover sticks (stiction)
+uint32_t exploreTurnSettledSince=0;
 bool explorePreviousHeadingMode=true;
 String exploreDriveStatus="idle";
+
 const float EXPLORE_GOAL_TOL_MM=23.0f;
-const float EXPLORE_HEADING_TOL_RAD=0.10f;
-const uint32_t EXPLORE_TURN_TIMEOUT_MS=3000;
+const uint32_t EXPLORE_TURN_TIMEOUT_MS=6000;
 const uint32_t EXPLORE_FORWARD_TIMEOUT_MS=30000;
-const int EXPLORE_STOP_MM=50; // requested emergency threshold, mm from sensor
+const uint32_t EXPLORE_SETTLE_BEFORE_MOVE_MS=350; // rover stands still -> gyro bias is refreshed
+const int EXPLORE_STOP_MM=50;   // requested emergency threshold, mm from sensor
 const int EXPLORE_SLOW_MM=150;
 uint8_t exploreInvalidRangeCount=0;
 int exploreLastValidRange=1000;
 float exploreRecoveryStartX=0, exploreRecoveryStartY=0;
 int exploreAvoidDirection=1;
+// Information for the web page about why / where the last drive ended.
+float exploreRemainingMm=0;                 // distance to the waypoint when the drive ended
+int exploreObstacleRange=0;                 // >0: forward sensor saw an obstacle this close (mm) ...
+float exploreObstacleX=0, exploreObstacleY=0, exploreObstacleThetaDeg=0; // ... from this pose
+bool exploreFinalLeg=false;                 // last waypoint of the planned path
+bool exploreArriveAfterBackoff=false;       // obstacle next to the scan position: back off a bit, then "arrived"
+float exploreBackoffMm=160.0f;
+
+// ---- Turn tuning (all values can be tuned on the real rover) ----
+const float EXPLORE_TURN_TOL_DEG=3.0f;        // accepted final heading error
+const float EXPLORE_TURN_SETTLED_DPS=6.0f;    // "standing still" threshold
+const uint32_t EXPLORE_TURN_SETTLE_MS=150;    // must stay inside tolerance this long
+const uint32_t TURN_PULSE_PERIOD_MS=50;       // coarse zone: duty cycle period
+const float TURN_DUTY_MIN=0.35f;              // minimum duty to overcome stiction
+const float TURN_DUTY_MAX=1.00f;
+const float TURN_KP_DUTY_PER_DEG=0.02f;       // duty = kp * remaining angle (50 deg -> 100 %)
+const float TURN_COAST_S=0.08f;               // estimated coasting time after switching the motors off
+const float TURN_FINE_ZONE_DEG=12.0f;         // below this: short "nudge" pulses
+const uint32_t TURN_FINE_PERIOD_MS=90;
+const uint32_t TURN_FINE_ON_MS=14;
+// ---- Heading hold on straight legs ----
+const uint32_t HOLD_PERIOD_MS=40;
+const float HOLD_KP_PER_DEG=0.08f;            // 12.5 deg error -> full correction
+const float HOLD_MAX_CORR=0.6f;               // slow wheel runs at least 40 % of the time
+
 float exploreWrap(float angle){
   while(angle>PI) angle-=2.0f*PI;
   while(angle< -PI) angle+=2.0f*PI;
   return angle;
 }
+
+// Same digital pin pattern as forward()/turnLeft()/..., but per wheel (-1,0,+1).
+// A wheel that is switched OFF coasts and KEEPS its last direction sign, so the
+// encoder ticks of the coasting wheel are still counted with the right sign.
+void driveWheels(int left,int right){
+  const int dl=(left!=0)?left:(int)leftWheelDirection;
+  const int dr=(right!=0)?right:(int)rightWheelDirection;
+  setWheelDirections(dl,dr);
+  digitalWrite(AIN1,left>0?HIGH:LOW);
+  digitalWrite(AIN2,left<0?HIGH:LOW);
+  digitalWrite(BIN1,right>0?HIGH:LOW);
+  digitalWrite(BIN2,right<0?HIGH:LOW);
+  digitalWrite(PWMA,left!=0?HIGH:LOW);
+  digitalWrite(PWMB,right!=0?HIGH:LOW);
+}
+
 void exploreDriveStop(const String &why){
   stopMotors();
+  exploreRemainingMm=hypotf(exploreGoalX-odomXmm,exploreGoalY-odomYmm);
   exploreStraightHeadingLock=false;
   useGyroHeading=explorePreviousHeadingMode;
   exploreDriveActive=false; exploreDrivePhase=0; exploreDriveStatus=why;
-  Serial.println("EXPLORE: "+why);
+  exploreTurnSettledSince=0; exploreTurnBoost=0; exploreArriveAfterBackoff=false;
+  Serial.println("EXPLORE: "+why+" (remaining "+String(exploreRemainingMm,0)+" mm)");
 }
+
+void exploreBeginTurn(uint8_t phase,const char* status){
+  const uint32_t now=millis();
+  exploreDrivePhase=phase; exploreDriveStatus=status;
+  explorePhaseStarted=now; exploreLastProgressMs=now;
+  exploreTurnLastErrDeg=exploreWrap(exploreTargetHeading-odomTheta)*180.0f/PI;
+  exploreTurnSettledSince=0; exploreTurnBoost=0;
+}
+
+void exploreStartStraight(uint32_t now){
+  stopMotors();
+  exploreDrivePhase=2; exploreDriveStatus="straight";
+  explorePhaseStarted=now; exploreLastCheck=0;
+  exploreInvalidRangeCount=0; exploreLastValidRange=1000;
+  exploreLegStartX=odomXmm; exploreLegStartY=odomYmm;
+  exploreLegDistance=hypotf(exploreGoalX-odomXmm,exploreGoalY-odomYmm);
+}
+
+// Called when the rover stands still: compute the turn from the CURRENT pose.
+void exploreBeginMove(){
+  const uint32_t now=millis();
+  updateOdometry();
+  const float dx=exploreGoalX-odomXmm, dy=exploreGoalY-odomYmm;
+  if(hypotf(dx,dy)<EXPLORE_GOAL_TOL_MM){exploreDriveStop("arrived");return;}
+  exploreLegHeading=atan2f(dy,dx);
+  exploreTargetHeading=exploreLegHeading;
+  const float errDeg=fabsf(exploreWrap(exploreLegHeading-odomTheta))*180.0f/PI;
+  Serial.printf("EXPLORE new waypoint: %.0f mm, heading error %.1f deg\n",hypotf(dx,dy),errDeg);
+  if(exploreStraightHint && errDeg<15.0f){exploreStartStraight(now);return;}
+  exploreBeginTurn(1,"turning");
+}
+
+// One step of the closed-loop turn. Returns true when the rover has settled
+// inside the tolerance. Calls exploreDriveStop() itself on a stall.
+bool exploreTurnStep(uint32_t now,float targetRad){
+  const float errDeg=exploreWrap(targetRad-odomTheta)*180.0f/PI;   // + = target is to the left
+  const float rate=gyroRateDps;                                    // + = turning left
+  if(fabsf(errDeg)<=EXPLORE_TURN_TOL_DEG && fabsf(rate)<EXPLORE_TURN_SETTLED_DPS){
+    driveWheels(0,0);
+    if(exploreTurnSettledSince==0)exploreTurnSettledSince=now;
+    if(now-exploreTurnSettledSince>=EXPLORE_TURN_SETTLE_MS){
+      stopMotors();exploreTurnSettledSince=0;return true;
+    }
+    return false;
+  }
+  exploreTurnSettledSince=0;
+  // Stall watchdog (stiction): only far away from the target.
+  if(fabsf(errDeg-exploreTurnLastErrDeg)>1.5f){
+    exploreTurnLastErrDeg=errDeg;exploreLastProgressMs=now;
+  }else if(fabsf(errDeg)>10.0f){
+    const uint32_t stalled=now-exploreLastProgressMs;
+    if(stalled>1800){exploreDriveStop("no_turn_progress");return false;}
+    exploreTurnBoost=fmaxf(exploreTurnBoost,fminf(0.45f,0.12f*float(stalled/300)));
+  }
+  // Predict where the rover ends up if the motors are switched off now.
+  const float predicted=errDeg-rate*TURN_COAST_S;
+  if(fabsf(predicted)<=EXPLORE_TURN_TOL_DEG || predicted*errDeg<=0.0f){
+    driveWheels(0,0);              // will coast into the tolerance (or be pushed back next cycle)
+    return false;
+  }
+  bool on;
+  if(fabsf(predicted)<TURN_FINE_ZONE_DEG){
+    on=(float)(now%TURN_FINE_PERIOD_MS) < (float)TURN_FINE_ON_MS+exploreTurnBoost*40.0f;
+  }else{
+    float duty=TURN_KP_DUTY_PER_DEG*fabsf(predicted)+exploreTurnBoost;
+    if(duty<TURN_DUTY_MIN)duty=TURN_DUTY_MIN;
+    if(duty>TURN_DUTY_MAX)duty=TURN_DUTY_MAX;
+    on=(float)(now%TURN_PULSE_PERIOD_MS) < duty*(float)TURN_PULSE_PERIOD_MS;
+  }
+  if(!on){driveWheels(0,0);return false;}
+  if(predicted>0.0f)driveWheels(-1,1);   // left turn  (same wheel signs as turnLeft())
+  else              driveWheels(1,-1);   // right turn (same wheel signs as turnRight())
+  return false;
+}
+
+// Straight driving with gyro heading hold: the wheel on the side we want to
+// turn towards is pulsed off a fraction of the time.
+void exploreHoldDrive(float desiredHeading){
+  const uint32_t now=millis();
+  const float errDeg=exploreWrap(desiredHeading-odomTheta)*180.0f/PI;   // + = target is to the left
+  float corr=HOLD_KP_PER_DEG*errDeg;
+  if(corr>HOLD_MAX_CORR)corr=HOLD_MAX_CORR;
+  if(corr<-HOLD_MAX_CORR)corr=-HOLD_MAX_CORR;
+  float leftDuty=1.0f,rightDuty=1.0f;
+  if(corr>0.0f)leftDuty=1.0f-corr; else rightDuty=1.0f+corr;
+  const float ph=(float)(now%HOLD_PERIOD_MS);
+  driveWheels(ph<leftDuty*(float)HOLD_PERIOD_MS?1:0, ph<rightDuty*(float)HOLD_PERIOD_MS?1:0);
+}
+
 void exploreDriveUpdate(){
   if(!exploreDriveActive)return;
   if(autonomousMode||mappingScanActive||scan3DActive){exploreDriveStop("interrupted");return;}
   const uint32_t now=millis();
-  if(exploreDrivePhase==1||exploreDrivePhase==3){
-    // During a short turn, measure ONLY gyro angle change since start of turn.
-    // No continual re-aiming based on changing waypoint coordinates.
-    const float turnedDeg=gyroTotalDegrees-exploreTurnStartGyro;
-    const float requestedDeg=exploreTurnRequested*180.0f/PI;
-    if(exploreTurnDirection*turnedDeg >= fabsf(requestedDeg)-4.0f || fabsf(requestedDeg)<6.0f){
+
+  if(exploreDrivePhase==7){                       // stand still, let the gyro bias settle
+    if(now-explorePhaseStarted<EXPLORE_SETTLE_BEFORE_MOVE_MS)return;
+    if(exploreSettleNext==3)exploreBeginTurn(3,"orienting");
+    else exploreBeginMove();
+    return;
+  }
+
+  if(exploreDrivePhase==1||exploreDrivePhase==3){ // closed-loop turn to absolute heading
+    if(!mpuAvailable){exploreDriveStop("gyro_unavailable");return;}
+    const bool done=exploreTurnStep(now,exploreTargetHeading);
+    if(!exploreDriveActive)return;
+    if(done){
+      Serial.printf("EXPLORE turn finished, heading error %.1f deg\n",
+                    exploreWrap(exploreTargetHeading-odomTheta)*180.0f/PI);
       if(exploreDrivePhase==3){exploreDriveStop("arrived");return;}
-      stopMotors();
-      // Preserve measured orientation at the end of the turn, then freeze it.
-      exploreStraightHeadingLock=true;
-      exploreDrivePhase=2; exploreDriveStatus="straight"; explorePhaseStarted=now; exploreLastCheck=0; exploreInvalidRangeCount=0; exploreLastValidRange=1000;
-      exploreLegStartX=odomXmm; exploreLegStartY=odomYmm;
-      exploreLegHeading=odomTheta;
-      // Distance was fixed when the leg was accepted. Do not re-aim after turning.
-      exploreLegDistance=hypotf(exploreGoalX-exploreLegStartX,exploreGoalY-exploreLegStartY);
-      Serial.printf("EXPLORE turn finished: measured %.1f / requested %.1f deg, leg %.0f mm\n",turnedDeg,requestedDeg,exploreLegDistance);
+      exploreStartStraight(now);
       return;
     }
-    if(now-explorePhaseStarted>EXPLORE_TURN_TIMEOUT_MS){exploreDriveStop("turn_timeout");return;}
-    if(!mpuAvailable){exploreDriveStop("gyro_unavailable");return;}
-    if(fabsf(gyroTotalDegrees-exploreTurnLastGyro)>2.0f){
-      exploreTurnLastGyro=gyroTotalDegrees;exploreLastProgressMs=now;
+    if(now-explorePhaseStarted>EXPLORE_TURN_TIMEOUT_MS){
+      const float errAbs=fabsf(exploreWrap(exploreTargetHeading-odomTheta))*180.0f/PI;
+      if(errAbs<8.0f){                           // good enough, continue
+        stopMotors();
+        if(exploreDrivePhase==3){exploreDriveStop("arrived");return;}
+        exploreStartStraight(now);
+      }else exploreDriveStop("turn_timeout");
     }
-    if(now-exploreLastProgressMs>750){exploreDriveStop("gyro_no_turn_progress");return;}
-    if(exploreTurnDirection>0)turnLeft();else turnRight();
-  }else if(exploreDrivePhase==2){
-    // No gyro correction and no encoder-derived yaw while driving straight.
+    return;
+  }
+
+  if(exploreDrivePhase==2){                       // straight leg with heading hold
     const float travelled=hypotf(odomXmm-exploreLegStartX,odomYmm-exploreLegStartY);
-    if(travelled>=exploreLegDistance-EXPLORE_GOAL_TOL_MM){exploreDriveStop("arrived");return;}
+    const float remX=exploreGoalX-odomXmm, remY=exploreGoalY-odomYmm;
+    const float remaining=hypotf(remX,remY);
+    if(travelled>=exploreLegDistance-EXPLORE_GOAL_TOL_MM || remaining<EXPLORE_GOAL_TOL_MM){
+      exploreDriveStop("arrived");return;
+    }
     if(now-explorePhaseStarted>EXPLORE_FORWARD_TIMEOUT_MS){exploreDriveStop("forward_timeout");return;}
-    if(now-exploreLastCheck>=110){
+    if(now-exploreLastCheck>=60){
       exploreLastCheck=now;
       int d=readDistance();
-      // Invalid/out-of-range readings are ignored; they do not abort exploration.
-      // Only a valid measurement may trigger slowing or an obstacle stop.
+      // Invalid/out-of-range readings are ignored; only a valid measurement may slow/stop.
       if(d>0 && d<=8000){
         exploreLastValidRange=d;
         if(d<=EXPLORE_STOP_MM){
           stopMotors();
+          // Remember what was seen where: the web page enters it into the map.
+          exploreObstacleRange=d;
+          exploreObstacleX=odomXmm;exploreObstacleY=odomYmm;
+          exploreObstacleThetaDeg=odomTheta*180.0f/PI;
           exploreRecoveryStartX=odomXmm;exploreRecoveryStartY=odomYmm;
-          exploreDrivePhase=4;exploreDriveStatus="reversing";
+          // Obstacle right next to the scan position: that is not a failure. Back off a
+          // little (room to turn) and report "arrived" instead of running away from the target.
+          exploreArriveAfterBackoff=(remaining<120.0f || (exploreFinalLeg && remaining<250.0f));
+          exploreBackoffMm=exploreArriveAfterBackoff?100.0f:160.0f;
+          exploreDrivePhase=4;
+          exploreDriveStatus=exploreArriveAfterBackoff?"backing_off":"reversing";
           explorePhaseStarted=now;
           return;
         }
       }
     }
     if(now-explorePhaseStarted>650 && travelled<5.0f){exploreDriveStop("no_forward_progress");return;}
-    // Existing manual forward() is full-power digital output.
-    // Slow approach uses short power pulses without altering manual control.
-    if(exploreLastValidRange<=EXPLORE_SLOW_MM){
-      if((now%220)<75)forward();
-      else stopMotors();
-    }else forward();
-  }else if(exploreDrivePhase==4){
-    // Same basic manoeuvre as the legacy explore mode: reverse, then turn.
-    if(hypotf(odomXmm-exploreRecoveryStartX,odomYmm-exploreRecoveryStartY)>=80.0f ||
-       now-explorePhaseStarted>=1800){
+    // Steer gently towards the goal (limited), freeze the heading right before arriving.
+    float desired=exploreLegHeading;
+    if(remaining>150.0f){
+      float dev=exploreWrap(atan2f(remY,remX)-exploreLegHeading);
+      if(dev>0.35f)dev=0.35f;
+      if(dev<-0.35f)dev=-0.35f;
+      desired=exploreLegHeading+dev;
+    }
+    if(exploreLastValidRange<=EXPLORE_SLOW_MM){   // slow approach: short pulses
+      if((now%220)<75)exploreHoldDrive(desired);
+      else driveWheels(0,0);
+    }else exploreHoldDrive(desired);
+    return;
+  }
+
+  if(exploreDrivePhase==4){
+    // Back up 16 cm before turning, so the front and sides clear the obstacle.
+    if(hypotf(odomXmm-exploreRecoveryStartX,odomYmm-exploreRecoveryStartY)>=exploreBackoffMm ||
+       now-explorePhaseStarted>=3000){
       stopMotors();
-      exploreDrivePhase=5;exploreDriveStatus="avoiding_turn";
-      explorePhaseStarted=now;
-      exploreTurnStartGyro=gyroTotalDegrees;
+      if(exploreArriveAfterBackoff){exploreDriveStop("arrived");return;}
       exploreAvoidDirection=-exploreAvoidDirection;
+      exploreTargetHeading=exploreWrap(odomTheta+(float)exploreAvoidDirection*80.0f*PI/180.0f);
+      exploreBeginTurn(5,"avoiding_turn");
       return;
     }
     backward();
-  }else if(exploreDrivePhase==5){
-    if(fabsf(gyroTotalDegrees-exploreTurnStartGyro)>=65.0f){
-      exploreDriveStop("avoided");return;
-    }
-    if(exploreAvoidDirection>0)turnLeft();else turnRight();
+    return;
+  }
+
+  if(exploreDrivePhase==5){                       // turn ~80 deg away, closed-loop
+    if(!mpuAvailable){exploreDriveStop("gyro_unavailable");return;}
+    const bool done=exploreTurnStep(now,exploreTargetHeading);
+    if(!exploreDriveActive)return;
+    if(done){exploreDriveStop("avoided");return;}
+    if(now-explorePhaseStarted>EXPLORE_TURN_TIMEOUT_MS)exploreDriveStop("avoided"); // best effort
   }
 }
+
 void handleExploreMove(){
   if(exploreDriveActive||autonomousMode||mappingScanActive||scan3DActive){server.send(409,"text/plain","Busy");return;}
   if(!server.hasArg("x")||!server.hasArg("y")){server.send(400,"text/plain","Missing target");return;}
@@ -4141,27 +4501,25 @@ void handleExploreMove(){
   if(!isfinite(x)||!isfinite(y)||dist>1200.0f||dist<5.0f){server.send(400,"text/plain","Waypoint must be 5..1200 mm away");return;}
   if(!mpuAvailable){server.send(409,"text/plain","Gyroscope unavailable");return;}
   explorePreviousHeadingMode=useGyroHeading;
-  useGyroHeading=true; // Turns always use the already calibrated gyro.
+  useGyroHeading=true; // heading always comes from the gyro, also while driving straight
   exploreStraightHeadingLock=false;
   exploreGoalX=x;exploreGoalY=y;
-  // A straight continuation skips the turn phase entirely.
-  const bool straightOnly=server.hasArg("straight") && server.arg("straight")=="1";
-  exploreTurnRequested=straightOnly ? 0.0f : exploreWrap(atan2f(dy,dx)-odomTheta);
-  exploreTurnDirection=(exploreTurnRequested>=0)?1:-1;
-  exploreTurnStartGyro=gyroTotalDegrees;
-  exploreTurnLastGyro=gyroTotalDegrees;
-  exploreDrivePhase=straightOnly ? 2 : 1;exploreDriveActive=true;
-  if(straightOnly){
-    exploreStraightHeadingLock=true;
-    exploreLegStartX=odomXmm;exploreLegStartY=odomYmm;
-    exploreLegHeading=odomTheta;exploreLegDistance=dist;
+  // "straight" is only a hint: if the heading is already within ~15 deg, the turn is skipped.
+  exploreStraightHint=server.hasArg("straight") && server.arg("straight")=="1";
+  exploreFinalLeg=server.hasArg("final") && server.arg("final")=="1";
+  exploreObstacleRange=0; exploreArriveAfterBackoff=false;
+  exploreDriveActive=true;
+  if(exploreStraightHint){
+    exploreBeginMove();                           // chained leg: no extra settle pause
+  }else{
+    stopMotors();
+    exploreDrivePhase=7;exploreSettleNext=1;
+    explorePhaseStarted=millis();exploreDriveStatus="settling";
   }
-  explorePhaseStarted=millis();exploreLastProgressMs=explorePhaseStarted;
-  exploreDriveStatus=straightOnly ? "straight" : "turning";
-  Serial.printf("EXPLORE new waypoint: %.0f mm, turn %.1f deg\n",dist,exploreTurnRequested*180.0f/PI);
   server.send(200,"text/plain","moving");
 }
-// Rotate in place to the scan heading, using the existing gyro-only turn phase.
+
+// Rotate in place to an ABSOLUTE heading (degrees, odometry frame).
 void handleExploreOrient(){
   if(exploreDriveActive||autonomousMode||mappingScanActive||scan3DActive){
     server.send(409,"text/plain","Busy");return;
@@ -4170,22 +4528,28 @@ void handleExploreOrient(){
     server.send(400,"text/plain","Missing theta or gyro unavailable");return;
   }
   updateOdometry();
-  const float target=server.arg("theta").toFloat()*PI/180.0f;
   explorePreviousHeadingMode=useGyroHeading;
   useGyroHeading=true;
   exploreStraightHeadingLock=false;
-  exploreTurnRequested=exploreWrap(target-odomTheta);
-  exploreTurnDirection=exploreTurnRequested>=0?1:-1;
-  exploreTurnStartGyro=gyroTotalDegrees;
-  exploreTurnLastGyro=gyroTotalDegrees;
+  exploreTargetHeading=exploreWrap(server.arg("theta").toFloat()*PI/180.0f);
   exploreGoalX=odomXmm;exploreGoalY=odomYmm;
-  exploreDrivePhase=3;exploreDriveActive=true;
-  explorePhaseStarted=millis();exploreLastProgressMs=explorePhaseStarted;
-  exploreDriveStatus="orienting";
+  exploreStraightHint=false;
+  exploreFinalLeg=false; exploreObstacleRange=0; exploreArriveAfterBackoff=false;
+  stopMotors();
+  exploreDriveActive=true;
+  exploreDrivePhase=7;exploreSettleNext=3;
+  explorePhaseStarted=millis();exploreDriveStatus="settling";
   server.send(200,"text/plain","orienting");
 }
+
 void handleExploreState(){
-  server.send(200,"application/json",String("{\"active\":")+(exploreDriveActive?"true":"false")+",\"status\":\""+exploreDriveStatus+"\"}");
+  server.send(200,"application/json",String("{\"active\":")+(exploreDriveActive?"true":"false")+
+    ",\"status\":\""+exploreDriveStatus+"\""+
+    ",\"rem\":"+String(exploreRemainingMm,0)+
+    ",\"range\":"+String(exploreObstacleRange)+
+    ",\"ox\":"+String(exploreObstacleX,1)+
+    ",\"oy\":"+String(exploreObstacleY,1)+
+    ",\"oth\":"+String(exploreObstacleThetaDeg,1)+"}");
 }
 
 // =====================================================

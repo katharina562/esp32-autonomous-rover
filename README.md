@@ -35,6 +35,10 @@ https://github.com/user-attachments/assets/345ec12e-ef98-480d-b979-ba7b330e9cce
 
 Using the distance sensor that is connected to two 180° servo motors (left to right; up and down), the rover can scan its environment and visualize it on a map in 2d and 3d. In combination with the odometry, multiple scans from different positions can map a whole area.
 
+**Demo:**
+
+https://github.com/user-attachments/assets/fbc69777-5223-4215-b996-3d4d0732e0c3
+
 ### 5. Autonomous exploration 
 
 Using the distance sensor for obstacle avoidance, the rover autonomously explores its surroundings by moving short distances and performing 180° scans at five different angles. When an obstacle is detected, it performs more detailed scans to map its surroundings. If an obstacle gets too close, the rover reverses, turns, and continues exploring in a different direction.

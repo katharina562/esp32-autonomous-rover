@@ -39,6 +39,8 @@ Using the distance sensor that is connected to two 180° servo motors (left to r
 
 https://github.com/user-attachments/assets/fbc69777-5223-4215-b996-3d4d0732e0c3
 
+https://github.com/user-attachments/assets/5540cbdf-f24f-4293-92bf-ce2f05676063
+
 ### 5. Autonomous exploration 
 
 Using the distance sensor for obstacle avoidance, the rover autonomously explores its surroundings by moving short distances and performing 180° scans at five different angles. When an obstacle is detected, it performs more detailed scans to map its surroundings. If an obstacle gets too close, the rover reverses, turns, and continues exploring in a different direction.

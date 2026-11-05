@@ -43,7 +43,7 @@ https://github.com/user-attachments/assets/5540cbdf-f24f-4293-92bf-ce2f05676063
 
 ### 5. Obstacle Avoidance for autonomous exploration 
 
-Using the distance sensor for obstacle avoidance, the rover autonomously explores its surroundings by moving short distances and performing 180° scans at five different angles. When an obstacle is detected, it performs more detailed scans to map its surroundings. If an obstacle gets too close, the rover reverses, turns, and continues exploring in a different direction.
+Using the distance sensor for obstacle avoidance, the rover autonomously explores its surroundings by moving short distances and performing 180° scans at six different angles. When an obstacle is detected, it performs more detailed scans to map its surroundings. If an obstacle gets too close, the rover reverses, turns, and continues exploring in a different direction.
 
 **Demo:**
 

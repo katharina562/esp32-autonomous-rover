@@ -750,18 +750,18 @@ STOPPED
     </div>
 
     <div style="border:1px solid #777;border-radius:8px;padding:12px;margin:12px 0;">
-      <h3>Explore Area — Phase 2: map and route preview</h3>
+      <h3>Explore Area — Autonomous Coverage Mapping</h3>
       <p>Distances from starting rover center (cm):</p>
       <label>Forward <input id="exploreFront" type="number" min="0" max="300" value="200" style="width:70px"></label>
       <label>Back <input id="exploreBack" type="number" min="0" max="300" value="0" style="width:70px"></label>
       <label>Left <input id="exploreLeft" type="number" min="0" max="300" value="100" style="width:70px"></label>
       <label>Right <input id="exploreRight" type="number" min="0" max="300" value="100" style="width:70px"></label>
-      <p><button id="explorePreview" class="scanButton">SHOW AREA + SAFETY ZONES</button></p>
+      <p><button id="explorePreview" class="scanButton">SHOW AREA + OBSTACLES</button></p>
       <p><button id="exploreFirstScan" class="scanButton">SCAN AREA FROM START (NO DRIVING)</button></p>
-      <p><button id="explorePlan" class="scanButton">PREVIEW NEXT TARGET + SAFE PATH</button></p>
+      <p><button id="explorePlan" class="scanButton">PREVIEW NEXT TARGET + PATH</button></p>
       <p><button id="exploreRun" class="scanButton">START MULTI-SCAN EXPLORATION (DRIVE)</button> <button id="exploreStop" class="scanButton">STOP EXPLORATION</button></p>
       <p id="exploreStatus">Test mode: supervised driving only.</p>
-      <p style="font-size:12px">Orange = inflated obstacle cells (12 cm center clearance; preview only). Blue = selected area. The rover does not drive automatically yet.</p>
+      <p style="font-size:12px">Orange = obstacle clearance around clustered hits (11 cm center radius). Blue = selected area. Unknown cells are traversable; the 8 cm proximity stop remains active.</p>
     </div>
     <div style="border:1px solid #1565c0;border-radius:10px;padding:14px;margin:12px 0;">
       <h3>Manual Multi-Scan Mapping (temporary)</h3>
@@ -1230,7 +1230,7 @@ let manualMapFullBounds = false;
 let exploreBounds = null;
 let explorePlanPath = [];
 let explorePlanTarget = null;
-const EXPLORE_RADIUS_MM = 140; // minimum center clearance for 20 cm wide rover; NOT zero safety margin
+const EXPLORE_RADIUS_MM = 110; // minimum center clearance for 20 cm wide rover; NOT zero safety margin
 function getExploreBounds() {
   // Manual mapping can use the entire 8 x 8 m grid, independent of the exploration rectangle.
   if (manualMapFullBounds) return {front:4000,back:4000,left:4000,right:4000};
@@ -1252,7 +1252,14 @@ function renderExploreOverlay(ctx,cellWidth,cellHeight) {
   const rCells=Math.ceil(EXPLORE_RADIUS_MM/CELL_SIZE_MM);
   ctx.fillStyle='rgba(235,135,35,0.24)';
   for(let row=0;row<GRID_ROWS;row++)for(let col=0;col<GRID_COLS;col++){
-    if(occupancyGrid[row][col]<0.5)continue;
+     if(occupancyGrid[row][col]<0.5||!observationGrid[row][col])continue;
+     let neighbors=0;
+     for(let dy=-1;dy<=1;dy++)for(let dx=-1;dx<=1;dx++){
+       if(!dx&&!dy)continue;
+       const rr=row+dy,cc=col+dx;
+       if(rr>=0&&rr<GRID_ROWS&&cc>=0&&cc<GRID_COLS&&observationGrid[rr][cc]&&occupancyGrid[rr][cc]>=EXPLORE_BLOCK_OCC)neighbors++;
+     }
+     if(!neighbors)continue;
     for(let dy=-rCells;dy<=rCells;dy++)for(let dx=-rCells;dx<=rCells;dx++){
       if(Math.hypot(dx,dy)*CELL_SIZE_MM>EXPLORE_RADIUS_MM)continue;
       const x=col+dx,y=row+dy;
@@ -1264,18 +1271,17 @@ function renderExploreOverlay(ctx,cellWidth,cellHeight) {
 }
 
 
-// Frontier-based exploration planner (v2). Never issues motor commands itself.
-// - Target = reachable known-free cell next to unexplored area inside the boundary,
-//   rated by path cost minus information gain (unknown cells around it).
+// Coverage-oriented exploration planner. Never issues motor commands itself.
+// - Unknown cells are traversable. Targets reward unknown cells in their neighborhood.
 // - Path = Dijkstra over (cell, heading) with 8 neighbours and a TURN PENALTY, then
 //   simplified to few straight segments (line of sight). Fewer turns = fewer errors.
 // - Every visited target (and every failed one) goes on a blacklist, so unobservable
 //   pockets behind obstacles are not approached over and over.
 const EXPLORE_TURN_COST_MM_PER_DEG = 2.0;  // a 90 deg turn costs as much as 18 cm of driving
 const EXPLORE_GAIN_MM_PER_CELL = 4.0;      // reward per unknown cell around the target
-const EXPLORE_MIN_UNKNOWN = 15;            // ignore tiny holes between sensor rays
+const EXPLORE_MIN_UNKNOWN = 1;            // allow small remaining unknown areas
 const EXPLORE_MAX_SEGMENT_MM = 900;        // firmware accepts 5..1200 mm per move
-const EXPLORE_MAX_CYCLES = 60;
+const EXPLORE_MAX_CYCLES = 180;
 const EXPLORE_BLOCK_OCC = 0.5;             // one contradicting free ray must not erase a hit (0.95-0.35=0.6)
 function exploreLog(msg){
   console.log('EXPLORE: '+msg);
@@ -1289,7 +1295,23 @@ function exploreLog(msg){
   el.textContent+=new Date().toLocaleTimeString()+'  '+msg+'\n';
   el.scrollTop=el.scrollHeight;
 }
+const EXPLORE_COVERAGE_TARGET = 95;
 let exploreBlacklist = [];
+let exploreLastPlanReason = '';
+function exploreCoverage(){
+  const b=getExploreBounds(); let total=0,seen=0,unknown=0;
+  for(let r=0;r<GRID_ROWS;r++)for(let c=0;c<GRID_COLS;c++){
+    const x=(c-ROVER_COL)*CELL_SIZE_MM,y=(ROVER_ROW-r)*CELL_SIZE_MM;
+    if(x < -b.left || x > b.right || y < -b.back || y > b.front)continue;
+    total++;if(observationGrid[r][c])seen++;else unknown++;
+  }
+  return {total,seen,unknown,pct:total?100*seen/total:0};
+}
+function exploreCoverageText(){const q=exploreCoverage();return q.pct.toFixed(1)+'% ('+q.seen+'/'+q.total+' cells; '+q.unknown+' unknown)';}
+function exploreStatusUpdate(message){
+  document.getElementById('exploreStatus').textContent=message+' | Coverage: '+exploreCoverageText();
+}
+
 function exploreSameDirection(a,b,c){
   const ux=b.x-a.x,uy=b.y-a.y,vx=c.x-b.x,vy=c.y-b.y;
   return Math.abs(Math.atan2(ux*vy-uy*vx,ux*vx+uy*vy))<0.05;
@@ -1334,31 +1356,42 @@ function computeExplorePlan() {
     const x=(c-ROVER_COL)*CELL_SIZE_MM,y=(ROVER_ROW-r)*CELL_SIZE_MM;
     return x>=-b.left&&x<=b.right&&y>=-b.back&&y<=b.front;
   };
-  // Inflate known obstacles by the rover footprint + margin.
-  const blocked=new Uint8Array(N);
-  const clearance=EXPLORE_RADIUS_MM;   // centre-to-obstacle clearance (see constant above)
-  const radius=Math.ceil(clearance/CELL_SIZE_MM);
-  for(let r=0;r<H;r++)for(let c=0;c<W;c++){
-    if(!observationGrid[r][c]||occupancyGrid[r][c]<EXPLORE_BLOCK_OCC)continue;
-    for(let dr=-radius;dr<=radius;dr++)for(let dc=-radius;dc<=radius;dc++){
-      if(Math.hypot(dc,dr)*CELL_SIZE_MM>clearance)continue;
-      const rr=r+dr,cc=c+dc;
-      if(rr>=0&&rr<H&&cc>=0&&cc<W)blocked[rr*W+cc]=1;
-    }
-  }
+   // Ignore isolated occupied cells for PLANNING ONLY; retain original map observations.
+   // A real thin obstacle may be filtered, so physical proximity stop remains enabled.
+   const blocked=new Uint8Array(N);
+   const clearance=EXPLORE_RADIUS_MM;
+   const radius=Math.ceil(clearance/CELL_SIZE_MM);
+   let isolated=0,clusters=0;
+   for(let r=0;r<H;r++)for(let c=0;c<W;c++){
+     if(!observationGrid[r][c]||occupancyGrid[r][c]<EXPLORE_BLOCK_OCC)continue;
+     let neighbors=0;
+     for(let dr=-1;dr<=1;dr++)for(let dc=-1;dc<=1;dc++){
+       if(!dc&&!dr)continue;
+       const rr=r+dr,cc=c+dc;
+       if(rr>=0&&rr<H&&cc>=0&&cc<W&&observationGrid[rr][cc]&&occupancyGrid[rr][cc]>=EXPLORE_BLOCK_OCC)neighbors++;
+     }
+     if(!neighbors){isolated++;continue;}
+     clusters++;
+     for(let dr=-radius;dr<=radius;dr++)for(let dc=-radius;dc<=radius;dc++){
+       if(Math.hypot(dc,dr)*CELL_SIZE_MM>clearance)continue;
+       const rr=r+dr,cc=c+dc;
+       if(rr>=0&&rr<H&&cc>=0&&cc<W)blocked[rr*W+cc]=1;
+     }
+   }
   const start=worldToCell(-currentPose.y,currentPose.x);
   if(start.col<0||start.col>=W||start.row<0||start.row>=H)throw Error('Rover outside map');
   const si=start.row*W+start.col;
   const knownFree=(c,r)=>observationGrid[r][c]&&occupancyGrid[r][c]<0.3;
-  // Only KNOWN free cells (plus the rover's own footprint) are driveable.
-  const ok=new Uint8Array(N);
-  const nearStart=Math.ceil(160/CELL_SIZE_MM);
-  for(let r=0;r<H;r++)for(let c=0;c<W;c++){
-    const i=r*W+c;
-    if(blocked[i]||!inBounds(c,r))continue;
-    if(knownFree(c,r)||Math.hypot(c-start.col,r-start.row)<=nearStart)ok[i]=1;
-  }
-  ok[si]=1;
+   // Unknown cells are traversable. Only clustered known obstacles block paths.
+   const ok=new Uint8Array(N);
+   let eligible=0,blockedInArea=0;
+   for(let r=0;r<H;r++)for(let c=0;c<W;c++){
+     const i=r*W+c;
+     if(!inBounds(c,r))continue;
+     if(blocked[i]){blockedInArea++;continue;}
+     ok[i]=1;eligible++;
+   }
+   ok[si]=1; // always permit planning out of current rover position
   // 8 directions, index k = k*45 deg counter-clockwise from "forward".
   const DIRS=[];
   for(let k=0;k<8;k++){
@@ -1397,25 +1430,31 @@ function computeExplorePlan() {
     }
     return n;
   };
-  let bestState=-1,bestScore=Infinity,reachable=0;
-  for(let i=0;i<N;i++){
-    if(!ok[i])continue;
-    let bd=Infinity,bs=-1;
-    for(let d=0;d<8;d++){const v=dist[i*8+d];if(v<bd){bd=v;bs=i*8+d;}}
-    if(bs<0)continue;
-    reachable++;
-    if(bd<100)continue;                         // at least 10 cm away
-    const c=i%W,r=(i/W)|0;
-    if(!knownFree(c,r))continue;
-    const x=(c-ROVER_COL)*CELL_SIZE_MM,y=(ROVER_ROW-r)*CELL_SIZE_MM;
-    if(exploreBlacklist.some(p=>Math.hypot(p.x-x,p.y-y)<200))continue;
-    if(countUnknown(c,r,2)<1)continue;          // must touch unexplored space
-    const g=countUnknown(c,r,5);
-    if(g<EXPLORE_MIN_UNKNOWN)continue;          // gaps between rays are not frontiers
-    const score=bd-EXPLORE_GAIN_MM_PER_CELL*g;
-    if(score<bestScore){bestScore=score;bestState=bs;}
-  }
-  if(bestState<0)return null;                   // nothing left to explore
+   let bestState=-1,bestScore=Infinity,reachable=0,candidates=0;
+   let rejectedDistance=0,rejectedBlacklist=0,rejectedGain=0;
+   // Prefer nearby destinations with large unexplored neighborhoods, including unknown targets.
+   for(let i=0;i<N;i++){
+     if(!ok[i])continue;
+     let bd=Infinity,bs=-1;
+     for(let d=0;d<8;d++){const v=dist[i*8+d];if(v<bd){bd=v;bs=i*8+d;}}
+     if(bs<0)continue;
+     reachable++;
+     if(bd<100){rejectedDistance++;continue;}
+     const c=i%W,r=(i/W)|0;
+     const x=(c-ROVER_COL)*CELL_SIZE_MM,y=(ROVER_ROW-r)*CELL_SIZE_MM;
+     if(exploreBlacklist.some(p=>Math.hypot(p.x-x,p.y-y)<120)){rejectedBlacklist++;continue;}
+     const g=countUnknown(c,r,5);
+     if(g<EXPLORE_MIN_UNKNOWN){rejectedGain++;continue;}
+     candidates++;
+     // More reward for larger unknown patches, but distance still matters.
+     const score=bd-EXPLORE_GAIN_MM_PER_CELL*g;
+     if(score<bestScore){bestScore=score;bestState=bs;}
+   }
+   exploreLastPlanReason='reachable='+reachable+', candidates='+candidates+
+     ', distance_rejected='+rejectedDistance+', visited_rejected='+rejectedBlacklist+
+     ', no_unknown_rejected='+rejectedGain+', blocked_cells='+blockedInArea+
+     ', isolated_hits_ignored='+isolated+', clustered_hits='+clusters;
+   if(bestState<0)return null;
   const cells=[];
   for(let s=bestState;s!==-1;s=prev[s])cells.push(s>>3);
   cells.reverse();
@@ -1841,7 +1880,7 @@ document.getElementById("resetGlobalMap").addEventListener("click",async()=>{
 document.getElementById('explorePreview').addEventListener('click',()=>{
   try {
     exploreBounds=getExploreBounds();
-    document.getElementById('exploreStatus').textContent='Area displayed. Orange safety zones are visualization only; no autonomous driving.';
+    document.getElementById('exploreStatus').textContent='Area displayed. Orange = clustered obstacles with rover footprint clearance.';
     drawOccupancyGrid();
   } catch(e){document.getElementById('exploreStatus').textContent=e.message;}
 });
@@ -1851,8 +1890,8 @@ document.getElementById('explorePlan').addEventListener('click',()=>{
   try{
     explorePlanPath=[];explorePlanTarget=null;
     const plan=computeExplorePlan();drawOccupancyGrid();
-    if(!plan){status.textContent='No reachable frontier left: exploration would be finished.';return;}
-    status.textContent='GREEN dashed line = proposed route ('+(plan.lengthMm/10).toFixed(0)+' cm), dot = next scan position. PREVIEW ONLY — no driving.';
+    if(!plan){exploreStatusUpdate('No target available: '+exploreLastPlanReason);return;}
+    exploreStatusUpdate('GREEN dashed line = proposed route ('+(plan.lengthMm/10).toFixed(0)+' cm), dot = next scan position. PREVIEW ONLY — no driving.');
   }catch(e){explorePlanPath=[];explorePlanTarget=null;drawOccupancyGrid();status.textContent='No safe path: '+e.message;}
 });
 document.getElementById('exploreFirstScan').addEventListener('click',async()=>{
@@ -1868,7 +1907,7 @@ document.getElementById('exploreFirstScan').addEventListener('click',async()=>{
     const response=await fetch('/mapscan');
     if(!response.ok)throw Error('Scan request failed: '+response.status);
     drawScan(await response.json());
-    status.textContent='First scan complete. Check blue boundary and orange inflated obstacles.';
+    status.textContent='First scan complete. Check blue boundary and orange obstacle clearance.';
   }catch(e){status.textContent='Scan failed: '+e.message;}
   finally{mapBusy=false;scanButton.disabled=false;document.getElementById('exploreFirstScan').disabled=false;}
 });
@@ -1880,7 +1919,7 @@ async function exploreStopDrive(){
   exploreRunning=false;
   try{await fetch('/explore/stop');}catch(e){}
 }
-document.getElementById('exploreStop').addEventListener('click',exploreStopDrive);
+document.getElementById('exploreStop').addEventListener('click',async()=>{exploreStatusUpdate('EXPLORATION STOPPED BY USER');exploreLog('USER STOP requested');await exploreStopDrive();});
 async function exploreMoveCell(p,straightOnly=false,finalLeg=false){
   // Map coordinates: x=right, y=forward. Odometry: x=forward, y=left.
   const wx=p.y,wy=-p.x;
@@ -1900,10 +1939,10 @@ async function exploreMoveCell(p,straightOnly=false,finalLeg=false){
         exploreLog('  sensor stop: obstacle '+state.range+' mm ahead');
       }
       if(state.status==='avoided'){exploreObstacleRecovery=true;return;}
-      if(state.status!=='arrived')throw Error('Drive stopped: '+state.status+' ('+state.rem+' mm to waypoint)');
+      if(state.status!=='arrived')throw Error('Drive stopped: '+state.status+' ('+state.rem+' mm to waypoint, target x='+Math.round(p.x)+' y='+Math.round(p.y)+' mm)');
       return;
     }
-    if(Date.now()-started>35000)throw Error('Waypoint watchdog timeout');
+    if(Date.now()-started>35000)throw Error('Waypoint watchdog timeout after 35s at target x='+Math.round(p.x)+' y='+Math.round(p.y)+' mm');
   }
   throw Error('Stopped by user');
 }
@@ -1917,7 +1956,7 @@ document.getElementById('exploreRun').addEventListener('click',async()=>{
   try{
     exploreBounds=getExploreBounds();
     exploreBlacklist=[];
-    exploreLog('--- exploration started ---');
+    exploreLog('--- exploration started; target '+EXPLORE_COVERAGE_TARGET+'% ---');
     for(let cycle=0;cycle<EXPLORE_MAX_CYCLES&&exploreRunning;cycle++){
       if(scanCount===0){
         mapBusy=true;
@@ -1925,14 +1964,17 @@ document.getElementById('exploreRun').addEventListener('click',async()=>{
         drawScan(await r.json());mapBusy=false;
       }
       await updateMapPose();
+      const coverage=exploreCoverage();
+      exploreLog('cycle '+(cycle+1)+' coverage '+exploreCoverageText());
+      if(coverage.pct>=EXPLORE_COVERAGE_TARGET){finished=true;break;}
       const plan=computeExplorePlan();drawOccupancyGrid();
-      if(!plan){finished=true;break;}          // no reachable frontier left = map is complete
+      if(!plan){throw Error('PLANNER_NO_TARGET: coverage below '+EXPLORE_COVERAGE_TARGET+'%. '+exploreLastPlanReason);}
       const path=explorePlanPath.slice();
       const target={x:plan.target.x,y:plan.target.y};
       const key=Math.round(target.x)+','+Math.round(target.y);
       exploreLog('cycle '+(cycle+1)+': target ('+Math.round(target.x)+','+Math.round(target.y)+') mm, '+
                  (plan.lengthMm/10).toFixed(0)+' cm, '+(path.length-1)+' legs');
-      status.textContent='Cycle '+(cycle+1)+': driving '+(plan.lengthMm/10).toFixed(0)+' cm to the next frontier';
+      exploreStatusUpdate('Cycle '+(cycle+1)+': driving '+(plan.lengthMm/10).toFixed(0)+' cm to the next target');
       let outcome='arrived',reason='';
       try{
         for(let k=1;k<path.length&&exploreRunning;k++){
@@ -1965,14 +2007,14 @@ document.getElementById('exploreRun').addEventListener('click',async()=>{
       const turned=Math.abs(((currentPose.theta-lastScanPose.theta+540)%360)-180);
       if(moved>80||turned>25){
         mapBusy=true;
-        status.textContent='Cycle '+(cycle+1)+': scanning';
+        exploreStatusUpdate('Cycle '+(cycle+1)+': scanning');
         const r=await fetch('/mapscan');if(!r.ok)throw Error('Scan failed: '+r.status);
         drawScan(await r.json());mapBusy=false;
       }else exploreLog('  pose unchanged since the last scan: planning again without scanning');
     }
-    if(finished){status.textContent='Exploration finished: no reachable frontier left.';exploreLog('--- finished ---');}
-    else if(exploreRunning)status.textContent='Stopped after maximum '+EXPLORE_MAX_CYCLES+' scan cycles.';
-  }catch(e){status.textContent='Exploration halted: '+e.message;exploreLog('HALTED: '+e.message);}
+    if(finished){exploreStatusUpdate('EXPLORATION COMPLETE: coverage target reached.');exploreLog('--- coverage target reached ---');}
+    else if(exploreRunning)exploreStatusUpdate('EXPLORATION INCOMPLETE: maximum '+EXPLORE_MAX_CYCLES+' cycles reached.');
+  }catch(e){exploreStatusUpdate('EXPLORATION HALTED: '+e.message);exploreLog('HALTED: '+e.message+' | '+exploreCoverageText());}
   finally{await exploreStopDrive();mapBusy=false;document.getElementById('exploreRun').disabled=false;}
 });
 
@@ -4232,11 +4274,11 @@ bool explorePreviousHeadingMode=true;
 String exploreDriveStatus="idle";
 
 const float EXPLORE_GOAL_TOL_MM=23.0f;
-const uint32_t EXPLORE_TURN_TIMEOUT_MS=6000;
+const uint32_t EXPLORE_TURN_TIMEOUT_MS=11000; // allow slow final alignment
 const uint32_t EXPLORE_FORWARD_TIMEOUT_MS=30000;
 const uint32_t EXPLORE_SETTLE_BEFORE_MOVE_MS=350; // rover stands still -> gyro bias is refreshed
-const int EXPLORE_STOP_MM=50;   // requested emergency threshold, mm from sensor
-const int EXPLORE_SLOW_MM=150;
+const int EXPLORE_STOP_MM=80;   // stop/reverse at 8 cm from front sensor (was 5 cm)
+const int EXPLORE_SLOW_MM=180; // begin slowing at 18 cm (was 15 cm)
 uint8_t exploreInvalidRangeCount=0;
 int exploreLastValidRange=1000;
 float exploreRecoveryStartX=0, exploreRecoveryStartY=0;
@@ -4250,7 +4292,7 @@ bool exploreArriveAfterBackoff=false;       // obstacle next to the scan positio
 float exploreBackoffMm=160.0f;
 
 // ---- Turn tuning (all values can be tuned on the real rover) ----
-const float EXPLORE_TURN_TOL_DEG=3.0f;        // accepted final heading error
+const float EXPLORE_TURN_TOL_DEG=5.0f; // avoid stalling for tiny heading corrections        // accepted final heading error
 const float EXPLORE_TURN_SETTLED_DPS=6.0f;    // "standing still" threshold
 const uint32_t EXPLORE_TURN_SETTLE_MS=150;    // must stay inside tolerance this long
 const uint32_t TURN_PULSE_PERIOD_MS=50;       // coarse zone: duty cycle period
@@ -4259,8 +4301,8 @@ const float TURN_DUTY_MAX=1.00f;
 const float TURN_KP_DUTY_PER_DEG=0.02f;       // duty = kp * remaining angle (50 deg -> 100 %)
 const float TURN_COAST_S=0.08f;               // estimated coasting time after switching the motors off
 const float TURN_FINE_ZONE_DEG=12.0f;         // below this: short "nudge" pulses
-const uint32_t TURN_FINE_PERIOD_MS=90;
-const uint32_t TURN_FINE_ON_MS=14;
+const uint32_t TURN_FINE_PERIOD_MS=100;
+const uint32_t TURN_FINE_ON_MS=30; // stronger pulses to overcome static friction
 // ---- Heading hold on straight legs ----
 const uint32_t HOLD_PERIOD_MS=40;
 const float HOLD_KP_PER_DEG=0.08f;            // 12.5 deg error -> full correction
@@ -4345,9 +4387,9 @@ bool exploreTurnStep(uint32_t now,float targetRad){
   // Stall watchdog (stiction): only far away from the target.
   if(fabsf(errDeg-exploreTurnLastErrDeg)>1.5f){
     exploreTurnLastErrDeg=errDeg;exploreLastProgressMs=now;
-  }else if(fabsf(errDeg)>10.0f){
+  }else if(fabsf(errDeg)>12.0f){
     const uint32_t stalled=now-exploreLastProgressMs;
-    if(stalled>1800){exploreDriveStop("no_turn_progress");return false;}
+    if(stalled>3000){exploreDriveStop("no_turn_progress");return false;}
     exploreTurnBoost=fmaxf(exploreTurnBoost,fminf(0.45f,0.12f*float(stalled/300)));
   }
   // Predict where the rover ends up if the motors are switched off now.
@@ -4410,7 +4452,7 @@ void exploreDriveUpdate(){
     }
     if(now-explorePhaseStarted>EXPLORE_TURN_TIMEOUT_MS){
       const float errAbs=fabsf(exploreWrap(exploreTargetHeading-odomTheta))*180.0f/PI;
-      if(errAbs<8.0f){                           // good enough, continue
+      if(errAbs<9.0f){                           // good enough, continue
         stopMotors();
         if(exploreDrivePhase==3){exploreDriveStop("arrived");return;}
         exploreStartStraight(now);
@@ -4449,6 +4491,9 @@ void exploreDriveUpdate(){
           explorePhaseStarted=now;
           return;
         }
+      }else{
+        // No echo / out of range: do not stop or retain an old slowdown reading.
+        exploreLastValidRange=1000;
       }
     }
     if(now-explorePhaseStarted>650 && travelled<5.0f){exploreDriveStop("no_forward_progress");return;}

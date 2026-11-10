@@ -51,4 +51,8 @@ https://github.com/user-attachments/assets/bbe564c9-8949-4e2f-bbac-a5b8dd49170e
 
 ### 6. Autonomous mapping 
 
-The rover autonomously explores a user-defined area, using obstacle avoidance to navigate safely around obstacles. While moving, it performs 2D scans (in the future 3d) and combines them into a map of its surroundings. Based on this map, it continuously selects new scan positions to gradually explore and map the entire area.
+The rover autonomously explores a user-defined area, using obstacle avoidance to navigate safely around obstacles. While moving, it performs 2D scans (currently working on 3d) and combines them into a map of its surroundings. Based on this map, it continuously selects new scan positions to gradually explore and map the entire area.
+
+**Demo:**
+
+https://github.com/user-attachments/assets/94096c1a-2589-47dd-906d-216dc1579e2c
